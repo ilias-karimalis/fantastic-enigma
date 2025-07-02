@@ -15,7 +15,7 @@
 //! ^ OSmosis model definition from SOSP 2025 submission
 //!
 
-use vstd::prelude::{verus, nat, Set};
+use vstd::prelude::{verus, nat, admit, Set};
 use state_machines_macros::*;
 
 verus!
@@ -156,7 +156,7 @@ pub open spec fn all_spaces_are_held(&self) -> bool {
 #[invariant]
 pub open spec fn all_resources_subset_spaces(&self) -> bool {
     forall |r: Resource| self.resources.contains(r) ==>
-        exists |se: SubsetEdge| self.subsets.contains(se)
+        exists |se: SubsetEdge| self.subsets.contains(se) && #[trigger] se.src() == r
 }
 
 // --------------------------------------- Resource Value Invariants ------------------------------
@@ -182,8 +182,7 @@ pub open spec fn resource_space_value_unique(&self) -> bool {
 /// The value of a Resource must be managed by the ResourceSpace that it is allocated from
 #[invariant]
 pub open spec fn resource_value_managed_by_space(&self) -> bool {
-    forall |se: SubsetEdge| #[trigger] self.subsets.contains(se) ==> 
-        se.dst().allocated_from(se.src())
+    forall |r: Resource, s: ResourceSpace| self.subsets.contains(SubsetEdge { src: r, dst: s }) ==> #[trigger] s.allocated_from(r)
 }
 
 // --------------------------------------- Resource Type Invariants -------------------------------
@@ -230,7 +229,20 @@ pub open spec fn map_subset_edge_square(&self) -> bool {
         }
     }
 }
-                
+
+/// Request edges must be directed to a domain which holds a space of the requested type
+#[invariant]
+pub open spec fn request_edge_type_consistent(&self) -> bool {
+    forall |re: RequestEdge| #[trigger] self.requests.contains(re) ==> {
+        exists |h: HoldEdge| {
+            &&& self.holds.contains(h)
+            &&& #[trigger] h.src() == re.dst()
+            &&& h.dst() is Space
+            &&& h.dst()->space.rtype() == re.rtype()
+        }
+    }
+}
+
 // Note:
 // I haven't added the following invariants, from the previous version of the model as I'm not sure
 // that they're necessary or useful, but they can be added back if needed:
@@ -260,6 +272,97 @@ init! {
 }
                 
 // --------------------------------------- Transition Rules ---------------------------------------
+// All transitions take as a first argument the `act` ProtectionDomain, which is the domain that is
+// performing this transition in the system. This is useful for checking relevant preconditions for
+// each transition. For example in the create_protection_domain transition, we need to check that 
+// the act PD holds the correct request edges to create the new PD and grant it the necessary 
+// requests.
+
+/// Creates a new Protection Domain in the system, which is an empty execution context, with a
+/// set of request edges, these can be used to obtain resources for the new PD.
+transition! {
+    create_protection_domain(act: ProtectionDomain, new: ProtectionDomain, reqs: Set<RequestEdge>)
+    {
+        // act must exist
+        require pre.domains.contains(act);
+        // new must not exist
+        require !pre.domains.contains(new);
+        // reqs must be a finite set
+        require reqs.finite();
+        // the requests must be directed to the act PD and sourced from the new PD
+        require forall |re: RequestEdge| #![auto] reqs.contains(re) ==> {
+            &&& re.src() == new
+            &&& re.dst() == act
+        };
+        // the requests must be of a type that the act PD holds
+        require forall |re: RequestEdge| reqs.contains(re) ==> {
+            exists |h: HoldEdge| #![auto] {
+                &&& pre.holds.contains(h)
+                &&& h.src() == act
+                &&& h.dst() is Space
+                &&& h.dst()->space.rtype() == re.rtype()
+            }
+        };
+
+        update domains = pre.domains.insert(new);
+        update requests = pre.requests.union(reqs);
+    }
+}
+/// Creates a new Resource in the system, attaching it to the act Protection Domain, which holds
+/// the resource space from which it's allocated. 
+transition! {
+    create_resource(act: ProtectionDomain, res: Resource)
+    {
+        // act must exist
+        require pre.domains.contains(act);
+        // res must not exist
+        require !pre.resources.contains(res);
+        // act must hold a resource space of the same type as res which contains the value of res
+        require exists |h: HoldEdge| #![auto] {
+            &&& pre.holds.contains(h)
+            &&& h.src() == act
+            &&& h.dst() is Space
+            &&& h.dst()->space.rtype() == res.rtype()
+            &&& h.dst()->space.allocated_from(res)
+        };
+
+        let space_hold_edge = choose |h: HoldEdge| #![auto] {
+            &&& pre.holds.contains(h) 
+            &&& h.src() == act 
+            &&& h.dst() is Space 
+            &&& h.dst()->space.rtype() == res.rtype() 
+            &&& h.dst()->space.allocated_from(res)
+        };
+        let space = space_hold_edge.dst()->space;
+
+        update resources = pre.resources.insert(res);
+        update holds = pre.holds.insert(HoldEdge { src: act, dst: ResourceLike::Resource { res } });
+        update subsets = pre.subsets.insert(SubsetEdge { src: res, dst: space });
+    }
+}
+
+/// Grants a resource held by the `act` Protection Domain to the `pd` Protection Domain.
+transition! {
+    grant_resource(act: ProtectionDomain, pd: ProtectionDomain, res: Resource)
+    {
+        // act must exist
+        require pre.domains.contains(act);
+        // pd must exist
+        require pre.domains.contains(pd);
+        // res must exist and be held by act
+        require pre.resources.contains(res);
+        require pre.holds.contains(HoldEdge { src: act, dst: ResourceLike::Resource { res } });
+        // A request edge must exist from pd to act for the resource type of res
+        require exists |re: RequestEdge| #![auto] {
+            &&& pre.requests.contains(re)
+            &&& re.src() == pd
+            &&& re.dst() == act
+            &&& re.rtype() == res.rtype()
+        };
+
+        update holds = pre.holds.insert(HoldEdge { src: pd, dst: ResourceLike::Resource { res } });
+    }
+}
 
 
 // -------------------------------------- Inductive Proofs ----------------------------------------
@@ -282,6 +385,47 @@ fn initialize_inductive(post: Self, dom: ProtectionDomain, initial_spaces: Set<R
             assert(post.holds.contains(he) && he.dst() == ResourceLike::Space { space: s });
     }
 }
+
+#[inductive(create_protection_domain)]
+fn create_protection_domain_inductive(pre: Self, post: Self, act: ProtectionDomain, new: ProtectionDomain, reqs: Set<RequestEdge>) { }
+
+#[inductive(create_resource)]
+fn create_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, res: Resource) {
+    let space_hold_edge = choose |h: HoldEdge| #![auto] {
+        &&& pre.holds.contains(h) 
+        &&& h.src() == act 
+        &&& h.dst() is Space 
+        &&& h.dst()->space.rtype() == res.rtype() 
+        &&& h.dst()->space.allocated_from(res)
+    };
+    let space = space_hold_edge.dst()->space;    
+    let new_subset_edge = SubsetEdge { src: res, dst: space };
+
+    // Invariant: all_resources_are_held
+    assert forall |r: Resource| post.resources.contains(r) implies
+        exists |h: HoldEdge| #[trigger] post.holds.contains(h) && h.dst() == ResourceLike::Resource { res: r } by {
+            let h = if (r == res) {
+                HoldEdge { src: act, dst: ResourceLike::Resource { res } }
+            } else {
+                choose |h| #[trigger] pre.holds.contains(h) && h.dst() == ResourceLike::Resource { res: r }
+            };
+            assert(post.holds.contains(h) && h.dst() == ResourceLike::Resource { res: r });
+        }
+
+    // Invariant: all_resources_subset_spaces
+    assert forall |r: Resource| post.resources.contains(r) implies
+        exists |se: SubsetEdge| post.subsets.contains(se) && #[trigger] se.src() == r by {
+            let se = if (r == res) {
+                SubsetEdge { src: res, dst: space }
+            } else {
+                choose |se| pre.subsets.contains(se) && #[trigger] se.src() == r
+            };
+            assert(post.subsets.contains(se) && se.src() == r);
+        }
+}
+
+#[inductive(grant_resource)]
+fn grant_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, pd: ProtectionDomain, res: Resource) { }
 
 } // osmosis
 } // state_machine!
@@ -374,10 +518,23 @@ impl HoldEdge {
     }
 }
 
-/// Map edge
+/// Map edge - Indicates a mapping relationship between resources or spaces.
 pub ghost enum MapEdge {
+    /// Indicates that this resource is the backing for a resource space, such as a page of virtual 
+    /// memory being used to back the address space of some process, i.e. storing the metadata for
+    /// the allocations.
+    /// 
+    /// TODO(Ilias): I'm not sure that this kind of edge is actually necessary, it doesn't seem to
+    ///              help in capturing mapping relationships, i.e. talking about the backing of a
+    ///              mapping (like the page table for a virtual memory mapping) and I'm not sure
+    ///              that we need it.
     SpaceBacking { sb_src: ResourceSpace, sb_dst: Resource },
+    /// Indicates that the resources allocated by the source ResourceSpace are mapped to the
+    /// resources allocated by the destination ResourceSpace, such as a virtual to physical memory
+    /// mapping.
     SpaceMap { sm_src: ResourceSpace, sm_dst: ResourceSpace },
+    /// Indicates that the source Resource is mapped to the destination Resource, such as a virtual
+    /// memory page being mapped to a physical memory page.
     ResourceMap { rm_src: Resource, rm_dst: Resource },
 }
 

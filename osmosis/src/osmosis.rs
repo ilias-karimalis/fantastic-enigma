@@ -364,6 +364,69 @@ transition! {
     }
 }
 
+/// Revokes a resource held by the `act` Protection Domain, from the `pd` Protection Domain.
+/// `act` must be holding the resource space from which the resource is allocated.
+transition! {
+    revoke_resource(act: ProtectionDomain, pd: ProtectionDomain, res: Resource)
+    {
+        // act must exist
+        require pre.domains.contains(act);
+        // pd must exist
+        require pre.domains.contains(pd);
+        // res must exist and be held by both act and pd
+        require pre.resources.contains(res);
+        require pre.holds.contains(HoldEdge { src: pd, dst: ResourceLike::Resource { res } });
+        require pre.holds.contains(HoldEdge { src: act, dst: ResourceLike::Resource { res } });
+        // act must hold the resource space from which the resource is allocated
+        require exists |h: HoldEdge| #![auto] {
+            &&& pre.holds.contains(h)
+            &&& h.src() == act
+            &&& h.dst() is Space
+            &&& h.dst()->space.allocated_from(res)
+        };
+
+        update holds = pre.holds.remove(HoldEdge { src: pd, dst: ResourceLike::Resource { res } });
+    }
+}
+
+transition! {
+    delete_resource(act: ProtectionDomain, res: Resource)
+    {
+        // act must exist
+        require pre.domains.contains(act);
+        // res must exist and be held by act
+        require pre.resources.contains(res);
+        require pre.holds.contains(HoldEdge { src: act, dst: ResourceLike::Resource { res } });
+        // act must hold the resource space from which the resource is allocated
+        require exists |h: HoldEdge| #![auto] {
+            &&& pre.holds.contains(h)
+            &&& h.src() == act
+            &&& h.dst() is Space
+            &&& h.dst()->space.allocated_from(res)
+        };
+        // There must not exist any hold edges to the resource other than the one from act
+        require forall |h: HoldEdge| pre.holds.contains(h) && h.dst() == ResourceLike::Resource { res } ==> h.src() == act;
+        // The resource must not be mapped or being used to map
+        require pre.resource_is_unmapped(res);
+
+        let space_hold_edge = choose |h: HoldEdge| #![auto] {
+            &&& pre.holds.contains(h) 
+            &&& h.src() == act 
+            &&& h.dst() is Space 
+            &&& h.dst()->space.allocated_from(res)
+        };
+        let space = space_hold_edge.dst()->space;
+        let res_hold_edge = HoldEdge { src: act, dst: ResourceLike::Resource { res } };
+        let res_subset_edge = SubsetEdge { src: res, dst: space };
+
+
+        update resources = pre.resources.remove(res);
+        update holds = pre.holds.remove(res_hold_edge);
+        update subsets = pre.subsets.remove(res_subset_edge);
+    }
+}
+
+
 
 // -------------------------------------- Inductive Proofs ----------------------------------------
 
@@ -426,6 +489,25 @@ fn create_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, res: 
 
 #[inductive(grant_resource)]
 fn grant_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, pd: ProtectionDomain, res: Resource) { }
+
+#[inductive(revoke_resource)]
+fn revoke_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, pd: ProtectionDomain, res: Resource) { }
+
+#[inductive(delete_resource)]
+fn delete_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, res: Resource) { }
+
+
+// ----------------------------------- Helper Spec  Functions -------------------------------------
+
+/// Returns true if the give resource is not contained in  any of the graph's map edges.
+pub open spec fn resource_is_unmapped(&self, res: Resource) -> bool {
+    forall |m| self.maps.contains(m) ==> match m {
+        MapEdge::SpaceBacking { sb_src, sb_dst } => sb_dst != res,
+        MapEdge::SpaceMap { sm_src, sm_dst } => true,
+        MapEdge::ResourceMap { rm_src, rm_dst } => rm_src != res && rm_dst != res,
+    }
+}
+
 
 } // osmosis
 } // state_machine!

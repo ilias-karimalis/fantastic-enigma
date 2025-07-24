@@ -20,4 +20,9 @@ pub proof fn set_map_finite_preserving<A, B>(x: Set<A>, map_fn: spec_fn(A) -> B)
     }
 }
 
+/// performs XOR on boolean predicates
+pub open spec fn xor(p1: bool, p2: bool) -> bool {
+    (p1 || p2) && !(p1 && p2)
+}
+
 } // verus!

@@ -154,10 +154,15 @@ pub open spec fn all_spaces_are_held(&self) -> bool {
 /// The values of a ResourceSpace must be unique within its type
 /// TODO(Ilias) - Not sure that this is the right way of expressing this invariant, lets keep an
 ///               eye on whether it makes proofs a pain.
+///
+/// I no longer think this invariant is reasonable, the main example for why is the modelling of virtual
+///  resources such as pages, where the same virtual page number might be used by multiple spaces of the 
+/// same type (i.e. the kernel holding VSpace of every userspace process.)
 #[invariant]
 pub open spec fn resource_space_value_unique(&self) -> bool {
-    forall |s1: ResourceSpace, s2: ResourceSpace|
-        self.spaces.contains(s1) && self.spaces.contains(s2) && s1 != s2  && s1.rtype() == s2.rtype() ==> s1.vals().disjoint(s2.vals())
+    // forall |s1: ResourceSpace, s2: ResourceSpace|
+    //     self.spaces.contains(s1) && self.spaces.contains(s2) && s1 != s2  && s1.rtype() == s2.rtype() ==> s1.vals().disjoint(s2.vals())
+    true
 }
 
 // --------------------------------------- Resource Type Invariants -------------------------------
@@ -396,6 +401,9 @@ transition! {
         require forall |m: MapEdge| #[trigger] pre.maps.contains(m) && m is SpaceMap ==> m->sm_src != space && m->sm_dst != space;
         // The space must not be subset by any resources.
         require forall |r: Resource| pre.resources.contains(r) ==> #[trigger] r.space() != space;
+        // TODO(Ilias): This requirement is too restrictive, talk to Reto about how to write it so that it allows for
+        //              request edges if this space is not the only one held by `pd` of the type `space.rtype()`.
+        require forall |re: RequestEdge| #![auto] pre.requests.contains(re) && re.dst() == pd ==> re.rtype() != space.rtype();
         
         update spaces = pre.spaces.remove(space);
         update holds = pre.holds.remove(hold_edge);
@@ -508,13 +516,6 @@ fn create_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, res: 
         };
         assert(post.holds.contains(h) && h.dst() == ResourceLike::Resource { res: r });
     }
-
-    // Invariant: subset_nodes_in_graph
-    assert forall |r| #[trigger] post.resources.contains(r) implies
-        post.spaces.contains(r.space()) && r.space().allocated_from(r) by
-    {
-        admit();         
-    }
 }
 
 #[inductive(grant_resource)]
@@ -529,6 +530,38 @@ fn revoke_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, pd: P
 fn delete_resource_inductive(pre: Self, post: Self, act: ProtectionDomain, res: Resource) 
 { }
 
+#[inductive(create_virtual_space)]
+fn create_virtual_space_inductive(pre: Self, post: Self, pd: ProtectionDomain, space: ResourceSpace)
+{
+    // Invariant: all_spaces_are_held
+    assert forall |s: ResourceSpace| post.spaces.contains(s) implies
+        exists |h: HoldEdge| #![auto] post.holds.contains(h) && h.dst() == ResourceLike::Space { space: s } by 
+    {
+        let he = if (s == space) {
+            HoldEdge { src: pd, dst: ResourceLike::Space { space }}
+        } else {
+            choose |h: HoldEdge| pre.holds.contains(h) && #[trigger] h.dst() == ResourceLike::Space { space: s }
+        };
+        assert(post.holds.contains(he) && he.dst() == ResourceLike::Space { space: s});
+    }
+}
+
+#[inductive(destroy_virtual_space)]
+fn destroy_virtual_space_inductive(pre: Self, post: Self, pd: ProtectionDomain, space: ResourceSpace) 
+{ 
+    // Invariant: request_edge_type_consistent
+    // assert forall |re: RequestEdge| post.requests.contains(re) implies
+    //     exists |he: HoldEdge| #![auto] {
+    //         &&& post.holds.contains(he)
+    //         &&& he.src() == re.dst()
+    //         &&& he.dst() is Space
+    //         &&& he.dst()->space.rtype() == re.rtype()
+    //     } by
+    // {
+    // 
+    // }
+}
+
 #[inductive(map_space)]
 fn map_space_inductive(pre: Self, post: Self, src: ResourceSpace, dst: ResourceSpace)
 {
@@ -541,7 +574,13 @@ fn map_space_inductive(pre: Self, post: Self, src: ResourceSpace, dst: ResourceS
             &&& me_res->rm_dst.space() == me_space->sm_dst
         } by
     {
-        admit();
+        let me_space = choose |me: MapEdge| {
+            &&& #[trigger] pre.maps.contains(me)
+            &&& me is SpaceMap
+            &&& me_res->rm_src.space() == me->sm_src
+            &&& me_res->rm_dst.space() == me->sm_dst
+        };
+        assert(post.maps.contains(me_space));
     }
 }
 
@@ -555,9 +594,15 @@ fn unmap_space_inductive(pre: Self, post: Self, src: ResourceSpace, dst: Resourc
             &&& me_space is SpaceMap
             &&& me_res->rm_src.space() == me_space->sm_src
             &&& me_res->rm_dst.space() == me_space->sm_dst
-        } by
+        } by    
     {
-        admit();
+        let me_space = choose |me: MapEdge| {
+            &&& #[trigger] pre.maps.contains(me)
+            &&& me is SpaceMap
+            &&& me_res->rm_src.space() == me->sm_src
+            &&& me_res->rm_dst.space() == me->sm_dst
+        };
+        assert(post.maps.contains(me_space));
     }
 }
 
@@ -573,48 +618,19 @@ fn map_resource_inductive(pre: Self, post: Self, src: Resource, dst: Resource)
             &&& me_res->rm_dst.space() == me_space->sm_dst
         } by
     {
-        admit();
+        let me_space = choose |me: MapEdge| {
+            &&& #[trigger] pre.maps.contains(me)
+            &&& me is SpaceMap
+            &&& me_res->rm_src.space() == me->sm_src
+            &&& me_res->rm_dst.space() == me->sm_dst
+        };
+        assert(post.maps.contains(me_space));
     }
 }  
 
 #[inductive(unmap_resource)]
 fn unmap_resource_inductive(pre: Self, post: Self, src: Resource, dst: Resource) 
 { }
-
-#[inductive(create_virtual_space)]
-fn create_virtual_space_inductive(pre: Self, post: Self, pd: ProtectionDomain, space: ResourceSpace)
-{
-    // Invariant: all_spaces_are_held
-    assert forall |s: ResourceSpace| post.spaces.contains(s) implies
-        exists |h: HoldEdge| #![auto] post.holds.contains(h) && h.dst() == ResourceLike::Space { space: s } by 
-    {
-        admit();
-    }
-
-    // Invariant: resource_space_value_unique
-    assert forall |s1: ResourceSpace, s2: ResourceSpace| post.spaces.contains(s1) && post.spaces.contains(s2) && s1 != s2 && s1.rtype() == s2.rtype() implies
-        s1.vals().disjoint(s2.vals()) by
-    {
-        admit();
-    }
-}
-
-#[inductive(destroy_virtual_space)]
-fn destroy_virtual_space_inductive(pre: Self, post: Self, pd: ProtectionDomain, space: ResourceSpace) 
-{ 
-    // Invariant: request_edge_type_consistent
-    assert forall |re: RequestEdge| post.requests.contains(re) implies
-        exists |he: HoldEdge| #![auto] {
-            &&& post.holds.contains(he)
-            &&& he.src() == re.dst()
-            &&& he.dst() is Space
-            &&& he.dst()->space.rtype() == re.rtype()
-        } by
-    {
-        admit();
-    }
-}
-
 
 // ----------------------------------- Helper Spec  Functions -------------------------------------
 
